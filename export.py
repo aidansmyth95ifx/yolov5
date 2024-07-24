@@ -60,6 +60,13 @@ import pandas as pd
 import torch
 from torch.utils.mobile_optimizer import optimize_for_mobile
 
+# handle Linux model on Windows
+# https://stackoverflow.com/questions/57286486/i-cant-load-my-model-because-i-cant-put-a-posixpath
+if os.name == 'nt':
+    import pathlib
+    temp = pathlib.PosixPath
+    pathlib.PosixPath = pathlib.WindowsPath
+
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
@@ -787,7 +794,7 @@ def export_pb(keras_model, file, prefix=colorstr("TensorFlow GraphDef:")):
 
 @try_export
 def export_tflite(
-    keras_model, im, file, int8, per_tensor, data, nms, agnostic_nms, prefix=colorstr("TensorFlow Lite:")
+    keras_model, im, file, int8, uint8, edgetpu, per_tensor, data, nms, agnostic_nms, prefix=colorstr("TensorFlow Lite:")
 ):
     # YOLOv5 TensorFlow Lite export
     """
@@ -839,15 +846,28 @@ def export_tflite(
     converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
     converter.target_spec.supported_types = [tf.float16]
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
-    if int8:
-        from models.tf import representative_dataset_gen
-
+    assert not (uint8 and int8), 'Pick one not both'
+    from models.tf import representative_dataset_gen
+    if uint8 or edgetpu:
+        #print('uint8 conversion ...')
         dataset = LoadImages(check_dataset(check_yaml(data))["train"], img_size=imgsz, auto=False)
         converter.representative_dataset = lambda: representative_dataset_gen(dataset, ncalib=100)
         converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
         converter.target_spec.supported_types = []
-        converter.inference_input_type = tf.uint8  # or tf.int8
-        converter.inference_output_type = tf.uint8  # or tf.int8
+        converter.inference_input_type = tf.uint8  # or tf.uint8
+        converter.inference_output_type = tf.uint8  # or tf.uint8
+        converter.experimental_new_quantizer = True
+        if per_tensor:
+            converter._experimental_disable_per_channel = True
+        f = str(file).replace(".pt", "-uint8.tflite")
+    elif int8:
+        #print('int8 conversion ...')
+        dataset = LoadImages(check_dataset(check_yaml(data))["train"], img_size=imgsz, auto=False)
+        converter.representative_dataset = lambda: representative_dataset_gen(dataset, ncalib=100)
+        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+        converter.target_spec.supported_types = []
+        converter.inference_input_type = tf.int8  # or tf.int8
+        converter.inference_output_type = tf.int8  # or tf.int8
         converter.experimental_new_quantizer = True
         if per_tensor:
             converter._experimental_disable_per_channel = True
@@ -1232,6 +1252,7 @@ def run(
     keras=False,  # use Keras
     optimize=False,  # TorchScript: optimize for mobile
     int8=False,  # CoreML/TF INT8 quantization
+    uint8=False,  # CoreML/TF INT8 quantization
     per_tensor=False,  # TF per tensor quantization
     dynamic=False,  # ONNX/TF/TensorRT: dynamic axes
     simplify=False,  # ONNX: simplify model
@@ -1387,7 +1408,7 @@ def run(
             f[6], _ = export_pb(s_model, file)
         if tflite or edgetpu:
             f[7], _ = export_tflite(
-                s_model, im, file, int8 or edgetpu, per_tensor, data=data, nms=nms, agnostic_nms=agnostic_nms
+                s_model, im, file, int8, uint8, edgetpu, per_tensor, data=data, nms=nms, agnostic_nms=agnostic_nms
             )
             if edgetpu:
                 f[8], _ = export_edgetpu(file)
@@ -1451,6 +1472,7 @@ def parse_opt(known=False):
     parser.add_argument("--keras", action="store_true", help="TF: use Keras")
     parser.add_argument("--optimize", action="store_true", help="TorchScript: optimize for mobile")
     parser.add_argument("--int8", action="store_true", help="CoreML/TF/OpenVINO INT8 quantization")
+    parser.add_argument("--uint8", action="store_true", help="TFLite UINT8 quantization")
     parser.add_argument("--per-tensor", action="store_true", help="TF per-tensor quantization")
     parser.add_argument("--dynamic", action="store_true", help="ONNX/TF/TensorRT: dynamic axes")
     parser.add_argument("--simplify", action="store_true", help="ONNX: simplify model")

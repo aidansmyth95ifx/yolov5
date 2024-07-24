@@ -541,12 +541,12 @@ def check_dataset(data, autodownload=True):
     # Resolve paths
     path = Path(extract_dir or data.get("path") or "")  # optional 'path' default to '.'
     if not path.is_absolute():
-        path = (ROOT / path).resolve()
+        path = Path(os.path.join(ROOT, path))
         data["path"] = path  # download scripts
     for k in "train", "val", "test":
         if data.get(k):  # prepend path
             if isinstance(data[k], str):
-                x = (path / data[k]).resolve()
+                x = Path(os.path.join(path, data[k]))
                 if not x.exists() and data[k].startswith("../"):
                     x = (path / data[k][3:]).resolve()
                 data[k] = str(x)
@@ -578,7 +578,7 @@ def check_dataset(data, autodownload=True):
             dt = f"({round(time.time() - t, 1)}s)"
             s = f"success ✅ {dt}, saved to {colorstr('bold', DATASETS_DIR)}" if r in (0, None) else f"failure {dt} ❌"
             LOGGER.info(f"Dataset download {s}")
-    check_font("Arial.ttf" if is_ascii(data["names"]) else "Arial.Unicode.ttf", progress=True)  # download fonts
+    #check_font("Arial.ttf" if is_ascii(data["names"]) else "Arial.Unicode.ttf", progress=True)  # download fonts
     return data  # dictionary
 
 

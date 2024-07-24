@@ -26,6 +26,10 @@ from PIL import ExifTags, Image, ImageOps
 from torch.utils.data import DataLoader, Dataset, dataloader, distributed
 from tqdm import tqdm
 
+import sys
+sys.path.append('../../')
+from common_functions.bgr_565_experiment import opencv_downsample_565
+
 from utils.augmentations import (
     Albumentations,
     augment_hsv,
@@ -136,7 +140,7 @@ class SmartDistributedSampler(distributed.DistributedSampler):
         g = torch.Generator()
         g.manual_seed(self.seed + self.epoch)
 
-        # determine the eventual size (n) of self.indices (DDP indices)
+        # determine the the eventual size (n) of self.indices (DDP indices)
         n = int((len(self.dataset) - self.rank - 1) / self.num_replicas) + 1  # num_replicas == WORLD_SIZE
         idx = torch.randperm(n, generator=g)
         if not self.shuffle:
@@ -260,7 +264,7 @@ class _RepeatSampler:
 
 class LoadScreenshots:
     # YOLOv5 screenshot dataloader, i.e. `python detect.py --source "screen 0 100 100 512 256"`
-    def __init__(self, source, img_size=640, stride=32, auto=True, transforms=None):
+    def __init__(self, source, img_size=640, stride=32, auto=True, transforms=None, load_565=False):
         """
         Initializes a screenshot dataloader for YOLOv5 with specified source region, image size, stride, auto, and
         transforms.
@@ -285,6 +289,7 @@ class LoadScreenshots:
         self.mode = "stream"
         self.frame = 0
         self.sct = mss.mss()
+        self.load_565 = load_565
 
         # Parse monitor shape
         monitor = self.sct.monitors[self.screen]
@@ -305,6 +310,9 @@ class LoadScreenshots:
         im0 = np.array(self.sct.grab(self.monitor))[:, :, :3]  # [:, :, :3] BGRA to BGR
         s = f"screen {self.screen} (LTWH): {self.left},{self.top},{self.width},{self.height}: "
 
+        if self.load_565:
+            im0, im0_565 = opencv_downsample_565(im0)
+
         if self.transforms:
             im = self.transforms(im0)  # transforms
         else:
@@ -318,7 +326,7 @@ class LoadScreenshots:
 class LoadImages:
     """YOLOv5 image/video dataloader, i.e. `python detect.py --source image.jpg/vid.mp4`"""
 
-    def __init__(self, path, img_size=640, stride=32, auto=True, transforms=None, vid_stride=1):
+    def __init__(self, path, img_size=640, stride=32, auto=True, transforms=None, vid_stride=1, load_565=False, cdv_dict={}):
         """Initializes YOLOv5 loader for images/videos, supporting glob patterns, directories, and lists of paths."""
         if isinstance(path, str) and Path(path).suffix == ".txt":  # *.txt file with img/vid/dir on each line
             path = Path(path).read_text().rsplit()
@@ -333,6 +341,8 @@ class LoadImages:
                 files.append(p)  # files
             else:
                 raise FileNotFoundError(f"{p} does not exist")
+        self.load_565 = load_565
+        self.cdv_dict = cdv_dict
 
         images = [x for x in files if x.split(".")[-1].lower() in IMG_FORMATS]
         videos = [x for x in files if x.split(".")[-1].lower() in VID_FORMATS]
@@ -393,6 +403,21 @@ class LoadImages:
             assert im0 is not None, f"Image Not Found {path}"
             s = f"image {self.count}/{self.nf} {path}: "
 
+        if self.load_565:
+            im0, im0_565 = opencv_downsample_565(im0)
+
+        if len(self.cdv_dict) and self.cdv_dict['chosen_input_mode'] == 'image_pre_resize':
+            from cross_domain_verification.parse_embedded_files import load_embedded_image
+            assert 'image_pre_resize_file' in self.cdv_dict and 'image_pre_resize_size' in self.cdv_dict and 'image_pre_resize_disp' in self.cdv_dict
+            image_pre_resize_file = self.cdv_dict['image_pre_resize_file']
+            image_pre_resize_size = tuple(self.cdv_dict['image_pre_resize_size'])
+            im0 = load_embedded_image(image_pre_resize_file, image_pre_resize_size)
+            im0 = im0[:,:,::-1] # RGB back to expected BGR
+            if self.cdv_dict['image_pre_resize_disp']:
+                cv2.imshow('Embedded image (565 to 888 then RGB converted to BGR)', im0)
+                cv2.waitKey(0)
+                cv2.destroyAllWindows()
+
         if self.transforms:
             im = self.transforms(im0)  # transforms
         else:
@@ -429,11 +454,12 @@ class LoadImages:
 
 class LoadStreams:
     # YOLOv5 streamloader, i.e. `python detect.py --source 'rtsp://example.com/media.mp4'  # RTSP, RTMP, HTTP streams`
-    def __init__(self, sources="file.streams", img_size=640, stride=32, auto=True, transforms=None, vid_stride=1):
+    def __init__(self, sources="file.streams", img_size=640, stride=32, auto=True, transforms=None, vid_stride=1, load_565=False):
         """Initializes a stream loader for processing video streams with YOLOv5, supporting various sources including
         YouTube.
         """
         torch.backends.cudnn.benchmark = True  # faster for fixed-size inference
+        self.load_565 = load_565
         self.mode = "stream"
         self.img_size = img_size
         self.stride = stride
@@ -508,6 +534,9 @@ class LoadStreams:
             raise StopIteration
 
         im0 = self.imgs.copy()
+        if self.load_565:
+            im0, im0_565 = opencv_downsample_565(im0)
+
         if self.transforms:
             im = np.stack([self.transforms(x) for x in im0])  # transforms
         else:

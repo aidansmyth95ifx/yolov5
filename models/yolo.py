@@ -15,6 +15,7 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 
+sys.path.append('../../..')
 import torch
 import torch.nn as nn
 
@@ -193,6 +194,7 @@ class BaseModel(nn.Module):
                 delattr(m, "bn")  # remove batchnorm
                 m.forward = m.forward_fuse  # update forward
         self.info()
+        LOGGER.info('Layers fused.')
         return self
 
     def info(self, verbose=False, img_size=640):
