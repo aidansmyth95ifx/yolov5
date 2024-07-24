@@ -221,9 +221,11 @@ def train(hyp, opt, device, callbacks):
         LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from {weights}")  # report
     else:
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
-    amp = check_amp(model)  # check AMP
+    print('Checking AMP ...')
+    amp =  True #check_amp(model)  # check AMP
 
     # Freeze
+    print('Freezing any frozen layers ...')
     freeze = [f"model.{x}." for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
     for k, v in model.named_parameters():
         v.requires_grad = True  # train all layers
@@ -248,14 +250,11 @@ def train(hyp, opt, device, callbacks):
     optimizer = smart_optimizer(model, opt.optimizer, hyp["lr0"], hyp["momentum"], hyp["weight_decay"])
 
     # Scheduler
+    print('Setting scheduler ...')
     if opt.cos_lr:
         lf = one_cycle(1, hyp["lrf"], epochs)  # cosine 1->hyp['lrf']
     else:
-
-        def lf(x):
-            """Linear learning rate scheduler function with decay calculated by epoch proportion."""
-            return (1 - x / epochs) * (1.0 - hyp["lrf"]) + hyp["lrf"]  # linear
-
+        lf = lambda x: (1 - x / epochs) * (1.0 - hyp["lrf"]) + hyp["lrf"]  # linear
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
 
     # EMA
@@ -265,6 +264,7 @@ def train(hyp, opt, device, callbacks):
     best_fitness, start_epoch = 0.0, 0
     if pretrained:
         if resume:
+            print('Smart resuming ...')
             best_fitness, start_epoch, epochs = smart_resume(ckpt, optimizer, ema, weights, epochs, resume)
         del ckpt, csd
 
@@ -301,8 +301,10 @@ def train(hyp, opt, device, callbacks):
         seed=opt.seed,
     )
     labels = np.concatenate(dataset.labels, 0)
+
     mlc = int(labels[:, 0].max())  # max label class
-    assert mlc < nc, f"Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}"
+    if mlc >= nc:
+        print(f"WARNNIG: Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc-1}")
 
     # Process 0
     if RANK in {-1, 0}:
@@ -371,7 +373,6 @@ def train(hyp, opt, device, callbacks):
             cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  # class weights
             iw = labels_to_image_weights(dataset.labels, nc=nc, class_weights=cw)  # image weights
             dataset.indices = random.choices(range(dataset.n), weights=iw, k=dataset.n)  # rand weighted idx
-
         # Update mosaic border (optional)
         # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
         # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
@@ -419,6 +420,7 @@ def train(hyp, opt, device, callbacks):
 
             # Backward
             scaler.scale(loss).backward()
+
 
             # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
             if ni - last_opt_step >= accumulate:
@@ -649,7 +651,7 @@ def main(opt, callbacks=Callbacks()):
             d = torch.load(last, map_location="cpu")["opt"]
         opt = argparse.Namespace(**d)  # replace
         opt.cfg, opt.weights, opt.resume = "", str(last), True  # reinstate
-        if is_url(opt_data):
+        if False:#is_url(opt_data):
             opt.data = check_file(opt_data)  # avoid HUB resume auth timeout
     else:
         opt.data, opt.cfg, opt.hyp, opt.weights, opt.project = (
@@ -739,7 +741,7 @@ def main(opt, callbacks=Callbacks()):
                 hyp["anchors"] = 3
         if opt.noautoanchor:
             del hyp["anchors"], meta["anchors"]
-        opt.noval, opt.nosave, save_dir = True, True, Path(opt.save_dir)  # only val/save final epoch
+        opt.noval, opt.nosave, save_dir = False, False, Path(opt.save_dir)  # only val/save final epoch
         # ei = [isinstance(x, (int, float)) for x in hyp.values()]  # evolvable indices
         evolve_yaml, evolve_csv = save_dir / "hyp_evolve.yaml", save_dir / "evolve.csv"
         if opt.bucket:

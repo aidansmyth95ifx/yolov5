@@ -12,7 +12,9 @@ from collections import OrderedDict, namedtuple
 from copy import copy
 from pathlib import Path
 from urllib.parse import urlparse
+import sys
 
+import os
 import cv2
 import numpy as np
 import pandas as pd
@@ -456,6 +458,8 @@ class DetectMultiBackend(nn.Module):
         super().__init__()
         w = str(weights[0] if isinstance(weights, list) else weights)
         pt, jit, onnx, xml, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs, paddle, triton = self._model_type(w)
+        assert not (tflite and pb)
+        assert not (tflite and saved_model)
         fp16 &= pt or jit or onnx or engine or triton  # FP16
         nhwc = coreml or saved_model or pb or tflite or edgetpu  # BHWC formats (vs torch BCWH)
         stride = 32  # default stride
@@ -654,7 +658,7 @@ class DetectMultiBackend(nn.Module):
 
         self.__dict__.update(locals())  # assign all variables to self
 
-    def forward(self, im, augment=False, visualize=False):
+    def forward(self, im, augment=False, visualize=False, dump_dir=None, cdv_dict={}):
         """Performs YOLOv5 inference on input images with options for augmentation and visualization."""
         b, ch, h, w = im.shape  # batch, channel, height, width
         if self.fp16 and im.dtype != torch.float16:
@@ -715,16 +719,37 @@ class DetectMultiBackend(nn.Module):
                 y = self.frozen_func(x=self.tf.constant(im))
             else:  # Lite or Edge TPU
                 input = self.input_details[0]
-                int8 = input["dtype"] == np.uint8  # is TFLite quantized uint8 model
-                if int8:
+                uint8 = input["dtype"] == np.uint8  # is TFLite quantized uint8 model
+                int8 = input["dtype"] == np.int8  # is TFLite quantized uint8 model
+                if uint8:
                     scale, zero_point = input["quantization"]
                     im = (im / scale + zero_point).astype(np.uint8)  # de-scale
+                elif int8:
+                    print('int8 model')
+                    scale, zero_point = input["quantization"]
+                    im = (im / scale + zero_point).astype(np.int8)  # de-scale
                 self.interpreter.set_tensor(input["index"], im)
+                if dump_dir is not None:
+                    im.tofile(os.path.join(dump_dir, 'input_data_tflite.bin'))
+                    np.save(os.path.join(dump_dir, 'input_data_tflite'), im)
                 self.interpreter.invoke()
                 y = []
-                for output in self.output_details:
+                for output in self.output_details: # should be just one output
                     x = self.interpreter.get_tensor(output["index"])
-                    if int8:
+                    if dump_dir is not None:
+                        x.tofile(os.path.join(dump_dir, 'output_data_tflite_raw.bin'))
+                        np.save(os.path.join(dump_dir, 'output_data_tflite_raw'), x)
+                    # Cross domain verification input as a substitute
+                    if len(cdv_dict) and cdv_dict['chosen_input_mode'] == 'model_output':
+                        sys.path.append('..')
+                        from cross_domain_verification.parse_embedded_files import load_embedded_model_output
+                        print('Cross domain verification data from "{}" as model output ...'.format(cdv_dict['model_output_file']))
+                        xx = np.reshape(load_embedded_model_output(cdv_dict['model_output_file']), x.shape)
+                        assert x.shape == xx.shape
+                        x = xx
+                        assert int8, "The data is int8 coming from our embedded EVB implementation. Ensure this flag is True"
+                    # denormalize
+                    if uint8 or int8:
                         scale, zero_point = output["quantization"]
                         x = (x.astype(np.float32) - zero_point) * scale  # re-scale
                     y.append(x)
@@ -1081,3 +1106,16 @@ class Classify(nn.Module):
         if isinstance(x, list):
             x = torch.cat(x, 1)
         return self.linear(self.drop(self.pool(self.conv(x)).flatten(1)))
+
+def convert_mtbml_log(input_fn, num_classes=80, dtype=np.int8):
+    '''
+    num_classes: Number of positive foreground classes.
+    '''
+
+    with open(input_fn, 'r') as f:
+        content = f.read()
+        lines = content.split(',')
+    lines = [int(x.replace('\n','')) for x in lines]
+    x = np.array(lines, dtype=dtype)
+    x = x.reshape((1, 6300, num_classes + 5))
+    return x

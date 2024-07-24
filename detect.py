@@ -34,8 +34,23 @@ import os
 import platform
 import sys
 from pathlib import Path
+import shutil
+import numpy as np
 
 import torch
+
+
+sys.path.append('..')
+from cross_domain_verification.parse_embedded_files import *
+sys.path.append('../../')
+from common_functions.misc import load_dictionary
+
+# handle Linux model on Windows
+# https://stackoverflow.com/questions/57286486/i-cant-load-my-model-because-i-cant-put-a-posixpath
+if os.name == 'nt':
+    import pathlib
+    temp = pathlib.PosixPath
+    pathlib.PosixPath = pathlib.WindowsPath
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -96,6 +111,10 @@ def run(
     half=False,  # use FP16 half-precision inference
     dnn=False,  # use OpenCV DNN for ONNX inference
     vid_stride=1,  # video frame-rate stride
+    dump=False,
+    load_565=False,
+    input_test_vectors_dir=None, # assume same structure as dump_dir - takes the Predicted.txt file and replaces model output with it
+    cdv_input_json=None,
 ):
     """
     Runs YOLOv5 detection inference on various sources like images, videos, directories, streams, etc.
@@ -160,28 +179,95 @@ def run(
     save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
     (save_dir / "labels" if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
 
+    if input_test_vectors_dir is not None:
+        print('Overwriting save_dir to be input_test_vectors_dir: {}'.format(input_test_vectors_dir))
+        save_dir = input_test_vectors_dir
+
+    dump_dir = os.path.join(save_dir, 'data_dump')
+    if dump:
+        print('Dumping image data to {} ...'.format(dump_dir))
+        os.makedirs(dump_dir, exist_ok=True)
+        # save odel for export to dump_dir
+        for weight_file in weights:
+            shutil.copy2(weight_file, os.path.join(dump_dir, os.path.basename(weight_file)))
+
     # Load model
     device = select_device(device)
     model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half)
     stride, names, pt = model.stride, model.names, model.pt
     imgsz = check_img_size(imgsz, s=stride)  # check image size
 
+    cdv_dict = {}
+    if cdv_input_json is not None:
+        print('\nLoading cross domain verification inputs from "{}" ...'.format(cdv_input_json))
+        cdv_dict = load_dictionary(cdv_input_json)
+        print('Cross domain verification input dictionary')
+        for key in cdv_dict:
+            print('\t{} - {}'.format(key, cdv_dict[key]))
+        print('')
+        assert cdv_dict['chosen_input_mode'] in cdv_dict['_supported_input_modes']
+
     # Dataloader
     bs = 1  # batch_size
+    cnt = 1
+
+    dump_webcam_frames = True
     if webcam:
         view_img = check_imshow(warn=True)
-        dataset = LoadStreams(source, img_size=imgsz, stride=stride, auto=pt, vid_stride=vid_stride)
+        dataset = LoadStreams(source, img_size=imgsz, stride=stride, auto=pt, vid_stride=vid_stride, load_565=load_565)
         bs = len(dataset)
+        # make directory to dump video frames as individual images
+        if dump_webcam_frames:
+            webcam_frames_dir = os.path.join(save_dir, 'webcame_frames')
+            os.makedirs(webcam_frames_dir, exist_ok=False)
     elif screenshot:
-        dataset = LoadScreenshots(source, img_size=imgsz, stride=stride, auto=pt)
+        dataset = LoadScreenshots(source, img_size=imgsz, stride=stride, auto=pt, load_565=load_565)
     else:
-        dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=pt, vid_stride=vid_stride)
+        dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=pt, vid_stride=vid_stride, load_565=load_565, cdv_dict=cdv_dict)
     vid_path, vid_writer = [None] * bs, [None] * bs
 
     # Run inference
     model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
     seen, windows, dt = 0, [], (Profile(device=device), Profile(device=device), Profile(device=device))
     for path, im, im0s, vid_cap, s in dataset:
+
+        if webcam and dump_webcam_frames:
+            for im0 in im0s:
+                frame_jpg = os.path.join(webcam_frames_dir, 'frame_{}.jpg'.format(cnt-1))
+                cv2.imwrite(frame_jpg, im0)
+                assert os.path.exists(frame_jpg)
+
+        img_dump_dir = os.path.join(dump_dir, 'image_{}'.format(cnt))
+        img_test_vector_pred_txt = os.path.join(img_dump_dir, 'Prediction.txt')
+        cnt += 1
+
+        # replace image post resize with CDV input
+        if len(cdv_dict) and cdv_dict['image_post_resize_file']:
+            im_transpose = np.transpose(im, (1,2,0)) # Get image shape to do reshaping. RGB - go from channel first back to channel last.
+            assert 'image_post_resize_file' in cdv_dict
+            embedded_data = cdv_dict['image_post_resize_file']
+            im = load_embedded_image(embedded_data, im_transpose.shape) # RGB channel last
+            im = np.transpose(im, (2, 0, 1)) # RGB channel first
+            if False:
+                im_transpose = np.transpose(im, (1,2,0)) # RGB
+                cv2.imshow('Image', im_transpose)
+                cv2.waitKey(0)
+                cv2.destroyAllWindows()
+
+        if dump:
+            os.makedirs(img_dump_dir, exist_ok=True)
+            image_size_tuple = np.array(list(im0s.shape), dtype=np.uint8)
+            im_transpose = np.transpose(im, (1,2,0)) # transpose im so we can save it for dump - CHW to HWC
+            image_size_tuple.tofile(os.path.join(img_dump_dir, 'image_size_tuple.bin'))
+            im.astype(np.uint32).tofile(os.path.join(img_dump_dir, 'image_post_resize.bin'))
+            im0s.astype(np.uint32).tofile(os.path.join(img_dump_dir, 'image_pre_resize.bin'))
+            np.save(os.path.join(img_dump_dir, 'image_size_tuple'), image_size_tuple)
+            np.save(os.path.join(img_dump_dir, 'image_pre_resize'), im0s)
+            np.save(os.path.join(img_dump_dir, 'image_post_resize'), im)
+            cv2.imwrite(os.path.join(img_dump_dir, 'image_pre_resize.jpg'), im0s)
+            cv2.imwrite(os.path.join(img_dump_dir, 'image_post_resize.jpg'), im_transpose)
+            shutil.copy2(path, os.path.join(img_dump_dir, os.path.basename(path)))
+
         with dt[0]:
             im = torch.from_numpy(im).to(model.device)
             im = im.half() if model.fp16 else im.float()  # uint8 to fp16/32
@@ -198,21 +284,49 @@ def run(
                 pred = None
                 for image in ims:
                     if pred is None:
-                        pred = model(image, augment=augment, visualize=visualize).unsqueeze(0)
+                        pred = model(image, augment=augment, visualize=visualize, cdv_dict=cdv_dict).unsqueeze(0)
                     else:
-                        pred = torch.cat((pred, model(image, augment=augment, visualize=visualize).unsqueeze(0)), dim=0)
+                        pred = torch.cat((pred, model(image, augment=augment, visualize=visualize, cdv_dict=cdv_dict).unsqueeze(0)), dim=0)
                 pred = [pred, None]
             else:
-                pred = model(im, augment=augment, visualize=visualize)
+                # usually comes here for the modes we run
+                img_dump_dir = img_dump_dir if dump else None
+                img_test_vector_pred_txt = img_test_vector_pred_txt if input_test_vectors_dir is not None else None
+                pred = model(im, augment=augment, visualize=visualize, dump_dir=img_dump_dir, cdv_dict=cdv_dict)
+                if dump:
+                    pred.numpy().flatten().tofile(os.path.join(img_dump_dir, 'pred_pre_nms.bin'))
+                    np.save(os.path.join(img_dump_dir, 'pred_pre_nms'), pred.numpy())
+
         # NMS
         with dt[2]:
+
             pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
+
+            for idx in range(len(pred)):
+                print(pred[idx].shape)
+
+            already_scaled = False
+            emb_flg = False
+            #TODO: get this wprking for .bin files, I recall it being WIP. Until it is working, use PuTTY text log
+            if len(cdv_dict) and cdv_dict['chosen_input_mode'] == 'nms_output':
+                assert 'nms_output_file' in cdv_dict
+                # overlay post NMS output to check embedded final output
+                pred, already_scaled = load_post_nms_emb_data(cdv_dict['nms_output_file'])
+                pred = [torch.Tensor(pred)]
+                emb_flg = True
+            if dump:
+                import copy
+                pred_tmp = copy.deepcopy(pred)
+                for idx in range(len(pred)):
+                    pred_tmp[idx] = pred_tmp[idx].numpy().flatten()
+                    pred_tmp[idx].tofile(os.path.join(img_dump_dir, 'pred_post_nms_output_idx_{}.bin'.format(idx)))
+                    np.save(os.path.join(img_dump_dir, 'pred_post_nms_output_idx_{}'.format(idx)), pred_tmp[idx])
 
         # Second-stage classifier (optional)
         # pred = utils.general.apply_classifier(pred, classifier_model, im, im0s)
 
         # Define the path for the CSV file
-        csv_path = save_dir / "predictions.csv"
+        csv_path = os.path.join(save_dir, "predictions.csv")
 
         # Create or append to the CSV file
         def write_to_csv(image_name, prediction, confidence):
@@ -220,7 +334,7 @@ def run(
             data = {"Image Name": image_name, "Prediction": prediction, "Confidence": confidence}
             with open(csv_path, mode="a", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=data.keys())
-                if not csv_path.is_file():
+                if not os.path.isfile(csv_path):
                     writer.writeheader()
                 writer.writerow(data)
 
@@ -234,15 +348,26 @@ def run(
                 p, im0, frame = path, im0s.copy(), getattr(dataset, "frame", 0)
 
             p = Path(p)  # to Path
-            save_path = str(save_dir / p.name)  # im.jpg
-            txt_path = str(save_dir / "labels" / p.stem) + ("" if dataset.mode == "image" else f"_{frame}")  # im.txt
+            save_path = os.path.join(save_dir, p.name)  # im.jpg
+            txt_path = os.path.join(save_dir, "labels", p.stem) + ("" if dataset.mode == "image" else f"_{frame}")  # im.txt
             s += "%gx%g " % im.shape[2:]  # print string
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             imc = im0.copy() if save_crop else im0  # for save_crop
             annotator = Annotator(im0, line_width=line_thickness, example=str(names))
+
             if len(det):
+
                 # Rescale boxes from img_size to im0 size
-                det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
+                if not already_scaled:
+
+                    # additional scaling required for embedded
+                    if emb_flg:
+                        det[:,0] *= im.shape[2]
+                        det[:,1] *= im.shape[3]
+                        det[:,2] *= im.shape[2]
+                        det[:,3] *= im.shape[3]
+
+                    det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
 
                 # Print results
                 for c in det[:, 5].unique():
@@ -255,6 +380,8 @@ def run(
                     label = names[c] if hide_conf else f"{names[c]}"
                     confidence = float(conf)
                     confidence_str = f"{confidence:.2f}"
+
+                    print('c {} confidence {:.2f} bbox {}'.format(c, confidence, xyxy))
 
                     if save_csv:
                         write_to_csv(p.name, label, confidence_str)
@@ -270,7 +397,7 @@ def run(
                         label = None if hide_labels else (names[c] if hide_conf else f"{names[c]} {conf:.2f}")
                         annotator.box_label(xyxy, label, color=colors(c, True))
                     if save_crop:
-                        save_one_box(xyxy, imc, file=save_dir / "crops" / names[c] / f"{p.stem}.jpg", BGR=True)
+                        save_one_box(xyxy, imc, file=os.path.join(save_dir, "crops", names[c], f"{p.stem}.jpg"), BGR=True)
 
             # Stream results
             im0 = annotator.result()
@@ -285,6 +412,7 @@ def run(
             # Save results (image with detections)
             if save_img:
                 if dataset.mode == "image":
+                    print('Saving image to {} ...'.format(save_path))
                     cv2.imwrite(save_path, im0)
                 else:  # 'video' or 'stream'
                     if vid_path[i] != save_path:  # new video
@@ -313,6 +441,21 @@ def run(
     if update:
         strip_optimizer(weights[0])  # update model (to fix SourceChangeWarning)
 
+def read_embedded_post_nms_logs(filename):
+    det = []
+    assert os.path.exists(filename)
+    with open(filename, 'r') as f:
+        for line in f.readlines():
+            line_list = line.split(',')
+            assert len(line_list) == 6
+            line_list_num = []
+            for i in range(len(line_list)):
+                if i != 4:
+                    line_list_num.append(int(line_list[i]))
+                else:
+                    line_list_num.append(float(line_list[i]))
+            det.append(line_list_num)
+    return torch.Tensor(det)
 
 def parse_opt():
     """
@@ -386,6 +529,11 @@ def parse_opt():
     parser.add_argument("--half", action="store_true", help="use FP16 half-precision inference")
     parser.add_argument("--dnn", action="store_true", help="use OpenCV DNN for ONNX inference")
     parser.add_argument("--vid-stride", type=int, default=1, help="video frame-rate stride")
+    parser.add_argument("--dump", action="store_true", help="Dump intermediate data to run directory")
+    parser.add_argument("--input_test_vectors_dir", type=str, help="Directory to use predictions from Nick's dump files")
+    parser.add_argument("--load_565", action="store_true", help="Use OpenCV to downsample image from BGR888 to BGR565 before upsampling back to BGR565")
+    parser.add_argument("--cdv_input_json", type=str, help="JSON file with cross domain verification input paths for testing EVB embedded implementation.")
+
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
     print_args(vars(opt))
